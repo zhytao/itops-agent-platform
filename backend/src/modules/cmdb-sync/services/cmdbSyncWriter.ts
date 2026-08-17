@@ -112,6 +112,7 @@ export function upsertServer(
     svrbizip_name?: string;
     osfamily_name?: string;
   },
+  placement: RackPlacement | null,
 ): ServerUpsertResult {
   const ip = fields.managementip_name || fields.svrbizip_name || '';
 
@@ -121,6 +122,7 @@ export function upsertServer(
       SET name = ?, os = ?, hostname = COALESCE(NULLIF(?, ''), hostname), ip_address = ?, updated_at = datetime('now','localtime')
       WHERE id = ?
     `).run(fields.name, fields.osfamily_name ?? '', ip, ip || null, existingId);
+    if (placement) upsertRackSlot(existingId, 'server', placement);
     return { id: existingId, action: 'update' };
   }
 
@@ -129,6 +131,8 @@ export function upsertServer(
     INSERT INTO servers (id, name, hostname, port, username, password, use_ssh_key, os, os_type, ip_address, enabled, tags, created_at, updated_at)
     VALUES (?, ?, ?, 22, '', NULL, 0, ?, 'linux', ?, 1, '[]', datetime('now','localtime'), datetime('now','localtime'))
   `).run(newId, fields.name, ip || fields.name, fields.osfamily_name ?? '', ip || null);
+
+  if (placement) upsertRackSlot(newId, 'server', placement);
 
   return {
     id: newId,
@@ -165,28 +169,37 @@ export function upsertDatacenterDevice(
     managementip_name?: string;
     finalclass?: string;
   },
+  rack: {
+    platformRackId: string | null; // 机柜关联（PDU 用 dc_pdus.rack_id 承载）
+    placement: RackPlacement | null; // 完整 U 位（有则写 dc_rack_slots）
+  },
 ): DeviceUpsertResult {
   const ip = fields.managementip_name || '';
   const finalClass = (fields.finalclass ?? '').toLowerCase();
   const isPDU = finalClass.includes('pdu') || finalClass.includes('ups');
+  // slot 的 device_type 需区分 pdu/ups（listWithDeviceInfo 的 JOIN 条件按这两个值匹配）
+  const slotDeviceType = finalClass.includes('ups') ? ('ups' as const) : ('pdu' as const);
 
   if (isPDU) {
     if (existingId) {
       db.prepare(`
-        UPDATE dc_pdus SET name = ?, updated_at = datetime('now','localtime')
+        UPDATE dc_pdus SET name = ?, rack_id = COALESCE(?, rack_id), updated_at = datetime('now','localtime')
         WHERE id = ?
-      `).run(fields.name, existingId);
+      `).run(fields.name, rack.platformRackId, existingId);
+      if (rack.placement) upsertRackSlot(existingId, slotDeviceType, rack.placement);
       return { id: existingId, action: 'update', table: 'dc_pdus' };
     }
     const newId = crypto.randomUUID();
     pdusRepo.create({
       id: newId,
       name: fields.name,
-      type: 'pdu',
+      type: slotDeviceType,
       status: 'active',
       ip_address: ip,
       model: fields.description ?? '',
+      rack_id: rack.platformRackId,
     });
+    if (rack.placement) upsertRackSlot(newId, slotDeviceType, rack.placement);
     return { id: newId, action: 'create', table: 'dc_pdus' };
   }
 
@@ -198,6 +211,7 @@ export function upsertDatacenterDevice(
       UPDATE network_devices SET name = ?, updated_at = datetime('now','localtime')
       WHERE id = ?
     `).run(fields.name, existingId);
+    if (rack.placement) upsertRackSlot(existingId, 'network_device', rack.placement);
     return { id: existingId, action: 'update', table: 'network_devices' };
   }
 
@@ -228,6 +242,7 @@ export function upsertDatacenterDevice(
     INSERT INTO network_devices (id, name, ip_address, vendor, device_type, status, snmp_enabled, created_at, updated_at)
     VALUES (?, ?, ?, 'unknown', 'unknown', 'online', 1, datetime('now','localtime'), datetime('now','localtime'))
   `).run(newId, fields.name, ip);
+  if (rack.placement) upsertRackSlot(newId, 'network_device', rack.placement);
   return { id: newId, action: 'create', table: 'network_devices' };
 }
 
@@ -240,4 +255,99 @@ export function findRoomIdByName(name: string): string | null {
     | { id: string }
     | undefined;
   return room?.id ?? null;
+}
+
+export function findRackIdByName(name: string): string | null {
+  const rack = db.prepare('SELECT id FROM dc_racks WHERE name = ?').get(name) as
+    | { id: string }
+    | undefined;
+  return rack?.id ?? null;
+}
+
+// ============================================================
+// 机柜位置（设备在哪个机柜 + 起始 U + 高度）
+// ============================================================
+
+/** iTop 机柜位置字段（rack_id/nb_u/position_v 均为字符串或数字） */
+export interface ITopRackPlacementFields {
+  rack_id?: string | number;
+  rack_name?: string;
+  nb_u?: string | number;
+  position_v?: string | number;
+}
+
+export interface RackPlacement {
+  platformRackId: string;
+  startU: number;
+  endU: number;
+}
+
+/**
+ * 解析 iTop 机柜 ID → 平台机柜 UUID
+ * 优先用 cmdb_sync_state 里 Rack 的 idMap（准确），fallback 按 rack_name 查 dc_racks
+ */
+export function resolveRackId(
+  fields: ITopRackPlacementFields,
+  itopRackIdMap: Record<string, string>,
+): string | null {
+  if (fields.rack_id && itopRackIdMap[String(fields.rack_id)]) {
+    return itopRackIdMap[String(fields.rack_id)];
+  }
+  if (fields.rack_name) {
+    return findRackIdByName(fields.rack_name);
+  }
+  return null;
+}
+
+/**
+ * 解析完整的机柜位置：机柜 + 起始 U + 高度。
+ * iTop 语义：position_v = 设备起始 U（1-based，从下往上），nb_u = 设备高度。
+ * 缺 U 位数据或机柜无法对应时返回 null（调用方跳过 U 位写入）。
+ */
+export function resolveRackPlacement(
+  fields: ITopRackPlacementFields,
+  itopRackIdMap: Record<string, string>,
+): RackPlacement | null {
+  const posV = Number(fields.position_v);
+  if (!fields.position_v || !Number.isFinite(posV) || posV < 1) {
+    return null;
+  }
+  const platformRackId = resolveRackId(fields, itopRackIdMap);
+  if (!platformRackId) {
+    return null;
+  }
+  const nbU = Number(fields.nb_u);
+  const height = Number.isFinite(nbU) && nbU >= 1 ? Math.floor(nbU) : 1;
+  const startU = Math.floor(posV);
+  return { platformRackId, startU, endU: startU + height - 1 };
+}
+
+/**
+ * 设备 U 位幂等 upsert 到 dc_rack_slots
+ * （slotsRepo 无按 device 查询的方法，此处用参数化 SQL 实现完整的 upsert 语义）
+ */
+export function upsertRackSlot(
+  deviceId: string,
+  deviceType: 'server' | 'network_device' | 'pdu' | 'ups',
+  placement: RackPlacement,
+): void {
+  if (placement.startU < 1 || placement.endU < placement.startU) {
+    throw new Error(`U 位数据无效 (start=${placement.startU}, end=${placement.endU})`);
+  }
+  const existing = db
+    .prepare('SELECT id FROM dc_rack_slots WHERE device_id = ? AND device_type = ?')
+    .get(deviceId, deviceType) as { id: string } | undefined;
+
+  if (existing) {
+    db.prepare(`
+      UPDATE dc_rack_slots
+      SET rack_id = ?, start_u = ?, end_u = ?, updated_at = datetime('now','localtime')
+      WHERE id = ?
+    `).run(placement.platformRackId, placement.startU, placement.endU, existing.id);
+  } else {
+    db.prepare(`
+      INSERT INTO dc_rack_slots (id, rack_id, device_id, device_type, start_u, end_u, position_face, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'front', datetime('now','localtime'), datetime('now','localtime'))
+    `).run(crypto.randomUUID(), placement.platformRackId, deviceId, deviceType, placement.startU, placement.endU);
+  }
 }

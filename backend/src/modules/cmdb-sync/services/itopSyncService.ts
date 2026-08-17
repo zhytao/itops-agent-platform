@@ -26,6 +26,8 @@ import {
   upsertServer,
   upsertDatacenterDevice,
   findRoomIdByName,
+  resolveRackId,
+  resolveRackPlacement,
 } from './cmdbSyncWriter';
 
 // ============================================================
@@ -45,6 +47,11 @@ interface ITopServer {
   managementip_name?: string;
   svrbizip_name?: string;
   osfamily_name?: string;
+  /** 机柜关联与 U 位（iTop 返回字符串） */
+  rack_id?: string | number;
+  rack_name?: string;
+  nb_u?: string | number;
+  position_v?: string | number;
 }
 interface ITopRack {
   name: string;
@@ -63,6 +70,11 @@ interface ITopDatacenterDevice {
   description?: string;
   managementip_name?: string;
   finalclass?: string;
+  /** 机柜关联与 U 位（iTop 返回字符串） */
+  rack_id?: string | number;
+  rack_name?: string;
+  nb_u?: string | number;
+  position_v?: string | number;
 }
 
 /** 每个 CI 类型的同步策略（策略模式，消除 syncXxx 的重复骨架） */
@@ -261,19 +273,37 @@ const rackStrategy: SyncStrategy<ITopRack> = {
 const serverStrategy: SyncStrategy<ITopServer> = {
   ciType: 'Server',
   oql: 'SELECT Server',
-  outputFields: 'name, managementip_name, svrbizip_name, osfamily_name, organization_name, status, serialnumber',
+  outputFields:
+    'name, managementip_name, svrbizip_name, osfamily_name, status, serialnumber, rack_id, rack_name, nb_u, position_v',
   upsert: (fields, { existingId }) => {
-    const res = upsertServer(existingId, fields);
-    return { platformId: res.id, action: res.action, table: 'servers', message: res.message };
+    // Rack 先于 Server 同步，其 idMap（iTop rack_id → 平台机柜 UUID）已就绪
+    const placement = resolveRackPlacement(fields, cmdbSyncStateRepo.getIdMap('Rack'));
+    const res = upsertServer(existingId, fields, placement);
+    // 有机柜关联但缺 U 位/机柜未映射时提示（servers 表无 rack 列，U 位是唯一承载）
+    const hint =
+      fields.rack_id && !placement
+        ? '有机柜关联但缺 U 位数据或机柜未同步，未写入 U 位'
+        : undefined;
+    return {
+      platformId: res.id,
+      action: res.action,
+      table: 'servers',
+      message: [res.message, hint].filter(Boolean).join('；') || undefined,
+    };
   },
 };
 
 const datacenterDeviceStrategy: SyncStrategy<ITopDatacenterDevice> = {
   ciType: 'DatacenterDevice',
   oql: 'SELECT DatacenterDevice',
-  outputFields: 'name, description, managementip_name, finalclass, organization_name, serialnumber',
+  outputFields:
+    'name, description, managementip_name, finalclass, status, serialnumber, rack_id, rack_name, nb_u, position_v',
   upsert: (fields, { existingId }) => {
-    const res = upsertDatacenterDevice(existingId, fields);
+    const rackIdMap = cmdbSyncStateRepo.getIdMap('Rack');
+    const res = upsertDatacenterDevice(existingId, fields, {
+      platformRackId: resolveRackId(fields, rackIdMap),
+      placement: resolveRackPlacement(fields, rackIdMap),
+    });
     return { platformId: res.id, action: res.action, table: res.table, message: res.message };
   },
 };

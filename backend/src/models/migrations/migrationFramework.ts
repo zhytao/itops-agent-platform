@@ -311,7 +311,9 @@ export class MigrationManager {
     return {
       currentVersion,
       latestVersion,
-      pendingCount: migrationStatuses.filter(m => m.status === 'pending').length,
+      // failed 的迁移也计入 pending：与 getPendingMigrations 一致（只认 success=1 为已应用），
+      // 修复后重启可自动重试；否则失败一次后 pendingCount=0，永远不会再执行
+      pendingCount: migrationStatuses.filter(m => m.status !== 'applied').length,
       appliedCount: migrationStatuses.filter(m => m.status === 'applied').length,
       totalMigrations: this.migrations.length,
       migrations: migrationStatuses
